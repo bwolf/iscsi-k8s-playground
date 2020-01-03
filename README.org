@@ -1,0 +1,284 @@
+#+TITLE: iSCSI with Kubernetes Playground
+
+This project is a playground to experiment with iSCSI and Kubernetes. It
+provides a virtual environment using Vagrant (and VirtualBox) to create two VMs
+(one for storage and one for a single Kubernetes instance) and how to setup
+iSCSI block storage and how to consume it from Kubernetes.
+
+* Storage
+Bring up the storage VM:
+#+BEGIN_SRC sh
+  vagrant up storage
+#+END_SRC
+
+Provision storage:
+#+BEGIN_SRC sh
+  vagrant ssh storage
+  lsblk # shows sdb
+  sudo fdisk /dev/sdb # n p ret ret t 8e p w
+  sudo pvcreate /dev/sdb1
+  sudo vgcreate vg_iscsi /dev/sdb1
+  sudo lvcreate -L 1G vg_iscsi
+#+END_SRC
+
+List logical volumes
+#+BEGIN_SRC sh
+  sudo lvs
+#+END_SRC
+
+#+BEGIN_EXAMPLE
+  vagrant@storage:~$ sudo lvs
+    LV    VG       Attr       LSize Pool Origin Data%  Meta%  Move Log Cpy%Sync Convert
+    lvol0 vg_iscsi -wi-a----- 1.00g
+#+END_EXAMPLE
+
+Thus the new logical volume is present as ~lvol0~ and it is mapped to the device
+tree as ~/dev/mapper/vg_iscsi-lvol0~.
+
+Define the target name for iSCSI:
+#+BEGIN_SRC sh
+  sudo tgtadm --lld iscsi --op new --mode target --tid 1 -T iqn.2019-12.foo.tld:storage.k8s
+#+END_SRC
+
+View the current configuration:
+#+BEGIN_SRC sh
+  sudo tgtadm --lld iscsi --op show --mode target
+#+END_SRC
+
+Result:
+#+BEGIN_EXAMPLE
+  Target 1: iqn.2019-12.foo.tld:storage.k8s
+      System information:
+          Driver: iscsi
+          State: ready
+      I_T nexus information:
+      LUN information:
+          LUN: 0
+              Type: controller
+              SCSI ID: IET     00010000
+              SCSI SN: beaf10
+              Size: 0 MB, Block size: 1
+              Online: Yes
+              Removable media: No
+              Prevent removal: No
+              Readonly: No
+              SWP: No
+              Thin-provisioning: No
+              Backing store type: null
+              Backing store path: None
+              Backing store flags:
+      Account information:
+      ACL information:
+#+END_EXAMPLE
+
+Add logical unit to the  target:
+#+BEGIN_SRC sh
+  sudo tgtadm --lld iscsi --op new --mode logicalunit --tid 1 --lun 1 -b /dev/mapper/vg_iscsi-lvol0
+#+END_SRC
+
+View the current configuration (again):
+#+BEGIN_SRC sh
+  sudo tgtadm --lld iscsi --op show --mode target
+#+END_SRC
+
+Result:
+#+BEGIN_EXAMPLE
+  Target 1: iqn.2019-12.foo.tld:storage.k8s
+      System information:
+          Driver: iscsi
+          State: ready
+      I_T nexus information:
+      LUN information:
+          LUN: 0
+              Type: controller
+              SCSI ID: IET     00010000
+              SCSI SN: beaf10
+              Size: 0 MB, Block size: 1
+              Online: Yes
+              Removable media: No
+              Prevent removal: No
+              Readonly: No
+              SWP: No
+              Thin-provisioning: No
+              Backing store type: null
+              Backing store path: None
+              Backing store flags:
+          LUN: 1
+              Type: disk
+              SCSI ID: IET     00010001
+              SCSI SN: beaf11
+              Size: 1074 MB, Block size: 512
+              Online: Yes
+              Removable media: No
+              Prevent removal: No
+              Readonly: No
+              SWP: No
+              Thin-provisioning: No
+              Backing store type: rdwr
+              Backing store path: /dev/mapper/vg_iscsi-lvol0
+              Backing store flags:
+      Account information:
+      ACL information:
+#+END_EXAMPLE
+
+To enable the target to accept any initiators (clients):
+#+BEGIN_SRC sh
+  sudo tgtadm --lld iscsi --op bind --mode target --tid 1 -I ALL
+#+END_SRC
+
+Verify that the target listens on the TCP port 3260:
+#+BEGIN_SRC sh
+  netstat -tulpn | grep 3260
+#+END_SRC
+
+Follow this [[https://www.cyberciti.biz/faq/howto-setup-debian-ubuntu-linux-iscsi-initiator/][guide]] to consume an iSCSI LUN on Debian. The following steps are all
+executed in the VM ~kube~.
+
+Install ~open-iscsi~:
+#+BEGIN_SRC sh
+  sudo apt-get install open-iscsi
+#+END_SRC
+
+Edit the file ~/etc/iscsi/iscsid.conf~ to change the startup type to automatic:
+#+BEGIN_EXAMPLE
+  node.startup = automatic
+#+END_EXAMPLE
+
+Restart the service:
+#+BEGIN_SRC sh
+  sudo systemctl restart open-iscsi
+#+END_SRC
+
+Find the LUN:
+#+BEGIN_SRC sh
+  sudo iscsiadm --mode discovery --type sendtargets --portal 192.168.202.201
+#+END_SRC
+
+Example output:
+#+BEGIN_EXAMPLE
+  192.168.202.201:3260,1 iqn.2019-12.foo.tld:storage.k8s
+#+END_EXAMPLE
+
+Now in mode ~node~ we need to login to consume the device (note that logging
+must also be done, if no authentication is present):
+#+BEGIN_SRC sh
+  sudo iscsiadm --mode node --targetname iqn.2019-12.foo.tld:storage.k8s \
+        --portal 192.168.202.201:3260 --login
+#+END_SRC
+
+Example output:
+#+BEGIN_EXAMPLE
+  Logging in to [iface: default, target: iqn.2019-12.foo.tld:storage.k8s, portal: 192.168.202.201,3260] (multiple)
+  Login to [iface: default, target: iqn.2019-12.foo.tld:storage.k8s, portal: 192.168.202.201,3260] successful.
+#+END_EXAMPLE
+
+The kernel logs some messages about the new block device like this (see
+~/var/log/syslog~):
+#+BEGIN_EXAMPLE
+  scsi 2:0:0:0: Attached scsi generic sg1 type 12
+  scsi 2:0:0:1: Direct-Access     IET      VIRTUAL-DISK     0001 PQ: 0 ANSI: 5
+  sd 2:0:0:1: Attached scsi generic sg2 type 0
+  sd 2:0:0:1: Power-on or device reset occurred
+  sd 2:0:0:1: [sdb] 2097152 512-byte logical blocks: (1.07 GB/1.00 GiB)
+  sd 2:0:0:1: [sdb] Write Protect is off
+  sd 2:0:0:1: [sdb] Mode Sense: 69 00 10 08
+  sd 2:0:0:1: [sdb] Write cache: enabled, read cache: enabled, supports DPO and FUA
+  sd 2:0:0:1: [sdb] Attached SCSI disk
+  iscsid: Connection1:0 to [target: iqn.2019-12.foo.tld:storage.k8s, portal: 192.168.202.201,3260] through [iface: default] is operational now
+#+END_EXAMPLE
+
+The new block device is also present via ~lsblk~ and it can be used now:
+#+BEGIN_SRC sh
+  sudo mkfs.ext4 /dev/sdb
+  sudo mount /dev/sdb /mnt
+  cd /mnt
+  sudo echo hallo | sudo tee -a abc
+  cat abc
+  hallo
+  cd /
+  sudo umount /mnt
+#+END_SRC
+
+To remove the LUN from the host, use the ~--logout~ operation:
+#+BEGIN_SRC sh
+  sudo iscsiadm --mode node --targetname iqn.2019-12.foo.tld:storage.k8s \
+       --portal 192.168.202.201:3260 --logout
+#+END_SRC
+
+Example output:
+#+BEGIN_EXAMPLE
+  Logging out of session [sid: 1, target: iqn.2019-12.foo.tld:storage.k8s, portal: 192.168.202.201,3260]
+  Logout of [sid: 1, target: iqn.2019-12.foo.tld:storage.k8s, portal: 192.168.202.201,3260] successful.
+#+END_EXAMPLE
+
+The device will no longer show up in ~lsblk~.
+
+* Kubernetes
+Bring up the Kubernetes machine:
+#+BEGIN_SRC sh
+  vagrant up kube
+#+END_SRC
+
+Install Kubernetes:
+#+BEGIN_SRC sh
+  sudo kubeadm config images pull
+  sudo kubeadm init --apiserver-advertise-address=192.168.202.202
+  mkdir -p $HOME/.kube
+  sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+  sudo chown $(id -u):$(id -g) $HOME/.kube/config
+  kubectl apply -f "https://cloud.weave.works/k8s/net?k8s-version=$(kubectl version | base64 | tr -d '\n')"
+  kubectl get pods -n kube-system -l name=weave-net
+  kubectl taint nodes --all node-role.kubernetes.io/master-
+#+END_SRC
+
+The following steps are based on the Kubernetes example for [[https://github.com/kubernetes/examples/tree/master/volumes/iscsi][iSCSI Storage]].
+
+Install packages and edit ~/etc/iscsi/iscsid.conf~ and change its startup type
+to automatic:
+#+BEGIN_SRC sh
+  sudo apt-get install open-iscsi
+  sudo vi /etc/iscsi/iscsid.conf
+  sudo systemctl restart open-iscsi
+#+END_SRC
+
+Create the deployment with a volume mount ~iscsi.yaml~:
+#+BEGIN_SRC yaml
+  ---
+  apiVersion: v1
+  kind: Pod
+  metadata:
+    name: iscsipd
+  spec:
+    containers:
+    - name: iscsipd-rw
+      #image: kubernetes/pause
+      image: busybox
+      command: ["/bin/sh", "-ec", "sleep 3600"]
+      volumeMounts:
+      - mountPath: "/mnt"
+        name: iscsipd-rw
+    volumes:
+    - name: iscsipd-rw
+      iscsi:
+        targetPortal: 192.168.202.201:3260
+        iqn: iqn.2019-12.foo.tld:storage.k8s
+        lun: 1
+        fsType: ext4
+        readOnly: false
+#+END_SRC
+
+In the storage VM, dump the network traffic:
+#+BEGIN_SRC sh
+  sudo tcpdump -vv -n -i eth1 tcp port 3260
+#+END_SRC
+
+Create:
+#+BEGIN_SRC sh
+  kubectl create -f iscsi.yaml
+#+END_SRC
+
+Verify (in the container check the ~/mnt~ directory):
+#+BEGIN_SRC sh
+  kubectl describe pods
+  kubectl exec -it iscsipd -- /bin/sh
+#+END_SRC
